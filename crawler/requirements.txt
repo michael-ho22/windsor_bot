@@ -1,0 +1,4 @@
+atlassian-python-api==3.41.16
+beautifulsoup4==4.12.3
+tqdm==4.66.4
+python-dotenv==1.0.1
