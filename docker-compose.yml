@@ -1,55 +1,124 @@
-version: "3.9"
-
 services:
   db:
     image: ankane/pgvector:latest
     container_name: windsor_db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_DB: ${PGDATABASE}
       POSTGRES_USER: ${PGUSER}
       POSTGRES_PASSWORD: ${PGPASSWORD}
-    ports:
-      - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./schemas.sql:/docker-entrypoint-initdb.d/01_schemas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER} -d ${PGDATABASE}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    env_file: .env.docker
 
   api:
     image: python:3.12-slim
     container_name: windsor_api
     working_dir: /workspace/api
-    command: bash -lc "pip install -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000"
-    env_file: .env
+    restart: unless-stopped
+    env_file: .env.docker
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PYTHONPATH: /workspace
+      RUNNING_IN_DOCKER: "1"
+    command: >
+      bash -lc "
+        pip install -r requirements.txt &&
+        python bootstrap.py &&
+        uvicorn main:app --host 0.0.0.0 --port 8000
+      "
     volumes:
       - ./:/workspace
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8001:8000"   # avoids host collisions
 
   app:
     image: python:3.12-slim
     container_name: windsor_app
     working_dir: /workspace/app
-    command: bash -lc "pip install -r requirements.txt && streamlit run app.py --server.address 0.0.0.0 --server.port 8501"
-    env_file: .env
+    restart: unless-stopped
+    env_file: .env.docker
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PYTHONPATH: /workspace
+      RUNNING_IN_DOCKER: "1"
+      API_URL: http://api:8000        # app->api inside docker
+    command: >
+      bash -lc "
+        pip install -r requirements.txt &&
+        streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+      "
     volumes:
       - ./:/workspace
     depends_on:
-      - api
+      api:
+        condition: service_started
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
 
   indexer:
     image: python:3.12-slim
     container_name: windsor_indexer
     working_dir: /workspace/indexer
-    command: bash -lc "pip install -r requirements.txt && python indexer.py --watch"
-    env_file: .env
+    restart: unless-stopped
+    env_file: .env.docker
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PYTHONPATH: /workspace
+      RUNNING_IN_DOCKER: "1"
+      HTML_DIR: /workspace/crawler/confluence_export
+    command: >
+      bash -lc "
+        pip install -r requirements.txt &&
+        python indexer.py --watch
+      "
     volumes:
       - ./:/workspace
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+
+  crawler:
+    image: python:3.12-slim
+    container_name: windsor_crawler
+    working_dir: /workspace/crawler
+    restart: unless-stopped
+    env_file: .env.docker
+    environment:
+      PYTHONPATH: /workspace
+      RUNNING_IN_DOCKER: "1"
+    volumes:
+      - ./:/workspace
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      bash -lc "
+        pip install -r requirements.txt &&
+        echo '[crawler] first run...' &&
+        python windsorwiki_crawler.py || true ;
+        while true; do
+          echo '[crawler] sleeping 48h...';
+          sleep 172800;
+          echo '[crawler] running scheduled crawl...';
+          pip install -r requirements.txt --quiet || true;
+          python windsorwiki_crawler.py || true;
+        done
+      "
 
 volumes:
   db_data:
