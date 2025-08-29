@@ -106,6 +106,30 @@ CREATE TABLE IF NOT EXISTS user_files (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version integer NOT NULL DEFAULT 1;
+
+-- Library / visibility
+ALTER TABLE user_files
+  ADD COLUMN IF NOT EXISTS visibility text DEFAULT 'private';  -- 'private' | 'library'
+
+-- Tag documents created from uploads so retrieval can scope by user/session
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS user_id    bigint,
+  ADD COLUMN IF NOT EXISTS session_id bigint,
+  ADD COLUMN IF NOT EXISTS visibility text DEFAULT 'private';  -- 'private' | 'library'
+
+CREATE INDEX IF NOT EXISTS idx_docs_user_session ON documents(user_id, session_id);
+
+-- Optional: explicit link table (lets you reuse one file across chats)
+CREATE TABLE IF NOT EXISTS chat_files (
+  id bigserial PRIMARY KEY,
+  session_id bigint REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  file_id    bigint REFERENCES user_files(id)    ON DELETE CASCADE,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(session_id, file_id)
+);
+
+
 -- helpful indexes
 CREATE INDEX IF NOT EXISTS ix_sessions_user     ON chat_sessions(user_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_memory_user       ON chat_memory(user_id, created_at);

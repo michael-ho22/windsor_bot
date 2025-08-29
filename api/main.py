@@ -3,15 +3,18 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 import re
-
+import hashlib, uuid, mimetypes
+from io import BytesIO
 import psycopg
 from psycopg.rows import dict_row
 from pgvector.psycopg import register_vector
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Header, Request
+from fastapi import (
+    Body, Depends, FastAPI, HTTPException, Query, Header, Request,
+    UploadFile, File, Form
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
 from psycopg.types.json import Json
 
 from openai import OpenAI, RateLimitError, APIConnectionError
@@ -58,6 +61,9 @@ HTML_DIR = os.getenv("HTML_DIR", "./crawler/confluence_export")
 AUTO_TITLE_MODE = os.getenv("AUTO_TITLE_MODE", "heuristic").lower()  # 'heuristic' | 'llm' | 'off'
 AUTO_TITLE_MAX_WORDS = int(os.getenv("AUTO_TITLE_MAX_WORDS", "8"))
 DEFAULT_SESSION_TITLE = os.getenv("DEFAULT_SESSION_TITLE", "New chat")
+
+# NEW: uploads
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -217,11 +223,32 @@ def health():
         return {"ok": False, "error": str(e)}
 
 
-# ===== Hybrid search + simple MMR =====
-def hybrid_search_sql(conn, query: str, v: List[float], k: int, alpha: float,
-                      space_keys: Optional[List[str]]):
+# ===== Retrieval (with user/session scope) =====
+def hybrid_search_sql(
+    conn,
+    query: str,
+    v: List[float],
+    k: int,
+    alpha: float,
+    space_keys: Optional[List[str]],
+    user_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+):
     space_filter_vec = "AND d.space_key = ANY(%s)" if space_keys else ""
     space_filter_bm  = "AND d.space_key = ANY(%s)" if space_keys else ""
+    # Scope: global docs OR user library OR this-session docs
+    scope_filter = ""
+    scope_params: List[Any] = []
+    if user_id is not None:
+        scope_filter = """
+          AND (
+            d.user_id IS NULL
+            OR (d.user_id = %s AND d.visibility = 'library')
+            OR (d.user_id = %s AND d.session_id = %s)
+          )
+        """
+        scope_params = [user_id, user_id, session_id]
+
     k_each = max(20, k)
 
     sql = f"""
@@ -230,7 +257,7 @@ def hybrid_search_sql(conn, query: str, v: List[float], k: int, alpha: float,
              1 - (c.embedding <=> %s::vector) AS vscore
       FROM document_chunks c
       JOIN documents d ON d.id = c.doc_id
-      WHERE 1=1 {space_filter_vec}
+      WHERE 1=1 {space_filter_vec} {scope_filter}
       ORDER BY c.embedding <=> %s::vector
       LIMIT %s
     ),
@@ -239,7 +266,7 @@ def hybrid_search_sql(conn, query: str, v: List[float], k: int, alpha: float,
              ts_rank(c.tsv, plainto_tsquery('english', %s)) AS tscore
       FROM document_chunks c
       JOIN documents d ON d.id = c.doc_id
-      WHERE c.tsv @@ plainto_tsquery('english', %s) {space_filter_bm}
+      WHERE c.tsv @@ plainto_tsquery('english', %s) {space_filter_bm} {scope_filter}
       ORDER BY tscore DESC
       LIMIT %s
     ),
@@ -264,14 +291,19 @@ def hybrid_search_sql(conn, query: str, v: List[float], k: int, alpha: float,
     """
 
     params: List[object] = []
+    # vec
     params.append(v)
     if space_keys: params.append(space_keys)
+    params.extend(scope_params)
     params.append(v)
     params.append(k_each)
+    # bm25
     params.append(query)
     params.append(query)
     if space_keys: params.append(space_keys)
+    params.extend(scope_params)
     params.append(k_each)
+    # final
     params.append(alpha)
     params.append(alpha)
     params.append(k_each)
@@ -285,7 +317,6 @@ def mmr_rerank(items, lambda_mult=0.7, top_n=8):
     """Greedy MMR with a simple Jaccard word-set dissimilarity proxy."""
     if not items:
         return items
-    # prepare
     for it in items:
         it["_wset"] = set((it.get("text") or "").lower().split())
     selected, remain = [], items[:]
@@ -318,7 +349,7 @@ def mmr_rerank(items, lambda_mult=0.7, top_n=8):
     return selected
 
 
-# ===== Search =====
+# ===== Search (optional user scope) =====
 @app.get("/search")
 def search(
     q: str = Query(...),
@@ -327,11 +358,13 @@ def search(
     per_doc: int = Query(2, ge=1, le=10),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     alpha: float = Query(0.6, ge=0.0, le=1.0),
+    session_id: Optional[int] = Query(None),
+    user_id: Optional[int] = Depends(get_current_user_id) if AUTH_MODE != "none" else None,
 ):
     v = embed_once(q)
     space_keys = [s.strip() for s in spaces.split(",") if s.strip()] if spaces else None
     with q_conn() as conn:
-        rows = hybrid_search_sql(conn, q, v, k * 3, alpha, space_keys)
+        rows = hybrid_search_sql(conn, q, v, k * 3, alpha, space_keys, user_id=user_id, session_id=session_id)
 
     by_doc, hits = {}, []
     for r in rows:
@@ -371,7 +404,7 @@ def ensure_session(conn, session_id: Optional[int], title: Optional[str], user_i
                 return row["id"]
         cur.execute(
             "INSERT INTO chat_sessions(title, user_id) VALUES(%s, %s) RETURNING id",
-            (title or "New chat", user_id)
+            (title or DEFAULT_SESSION_TITLE, user_id)
         )
         return cur.fetchone()["id"]
 
@@ -409,6 +442,8 @@ def get_user_style(conn, user_id: Optional[int]) -> tuple[str, str]:
             tone, depth = r["tone"], r["depth"]
     return tone, depth
 
+
+# ----- Auto title helpers -----
 _TRIVIAL_OPENERS = {
     "hi","hello","hey","yo","sup","good morning","good afternoon","good evening",
     "how are you","what's up","whats up"
@@ -475,6 +510,7 @@ def generate_chat_title(user_text: str) -> Optional[str]:
     if t: return t
     return _gen_title_llm(user_text, AUTO_TITLE_MAX_WORDS) if AUTO_TITLE_MODE == "llm" else None
 
+
 # ===== Chat (RAG) =====
 @app.post("/answer")
 def answer(
@@ -502,6 +538,7 @@ def answer(
     with q_conn() as conn:
         # session
         session_id = ensure_session(conn, payload.get("session_id"), title, user_id)
+
         # optional memory
         if memory_note:
             with conn.cursor() as cur:
@@ -510,10 +547,12 @@ def answer(
                     VALUES (%s, %s, %s, %s)
                 """, (session_id, user_id, "note", memory_note))
                 conn.commit()
+
         # store user message
         add_message(conn, session_id, "user", q)
-        # --- Auto-title once on first real message (unless frontend already sent a title) ---
-        if not title:  # only if the client didn't set one
+
+        # auto-title (only if current title is default/blank and client didn't set one)
+        if not title:
             try:
                 with conn.cursor(row_factory=dict_row) as cur2:
                     cur2.execute("SELECT title FROM chat_sessions WHERE id=%s", (session_id,))
@@ -525,12 +564,14 @@ def answer(
                             cur2.execute("UPDATE chat_sessions SET title=%s WHERE id=%s", (new_title, session_id))
                             conn.commit()
             except Exception:
-                pass  # never break chat on title failure
+                pass
+
         # history
         hist = get_history(conn, session_id, limit=12)
-        # retrieval
+
+        # retrieval (scope to user/library + this session)
         v = embed_once(q)
-        rows = hybrid_search_sql(conn, q, v, k * 3, alpha, space_keys)
+        rows = hybrid_search_sql(conn, q, v, k * 3, alpha, space_keys, user_id=user_id, session_id=session_id)
 
         by_doc, hits = {}, []
         for r in rows:
@@ -604,13 +645,15 @@ def list_sessions(
         if AUTH_MODE == "none":
             cur.execute("""
               SELECT id, title, created_at FROM chat_sessions
-              ORDER BY created_at DESC LIMIT %s
+              ORDER BY created_at DESC
+              LIMIT %s
             """, (limit,))
         else:
             cur.execute("""
               SELECT id, title, created_at FROM chat_sessions
               WHERE user_id = %s
-              ORDER BY created_at DESC LIMIT %s
+              ORDER BY created_at DESC
+              LIMIT %s
             """, (user_id, limit))
         return {"sessions": cur.fetchall()}
 
@@ -631,7 +674,6 @@ def get_session_messages(
               LIMIT %s
             """, (session_id, limit))
         else:
-            # ensure session belongs to user
             cur.execute("SELECT user_id FROM chat_sessions WHERE id=%s", (session_id,))
             row = cur.fetchone()
             if not row or row["user_id"] != user_id:
@@ -652,7 +694,6 @@ def signup(body: Dict[str, str] = Body(...), request: Request = None):
     if AUTH_MODE == "none":
         raise HTTPException(400, "Auth disabled")
 
-    # rate limit by IP
     rate_limit(f"signup:{request.client.host}", max_calls=10, per_seconds=300)  # 10 / 5min
 
     email = (body.get("email") or "").strip().lower()
@@ -675,14 +716,12 @@ def signup(body: Dict[str, str] = Body(...), request: Request = None):
         uid = cur.fetchone()["id"]
         conn.commit()
 
-    # fetch token_version and issue token with ver
     with q_conn() as conn2, conn2.cursor(row_factory=dict_row) as cur2:
         cur2.execute("SELECT token_version FROM users WHERE id=%s", (uid,))
         ver = int(cur2.fetchone()["token_version"])
 
     token = create_jwt(uid, email, ver)
 
-    # fire-and-forget welcome email (safe to fail)
     try:
         send_welcome_email(email)
     except Exception:
@@ -696,7 +735,6 @@ def login(body: Dict[str, str] = Body(...), request: Request = None):
     if AUTH_MODE == "none":
         raise HTTPException(400, "Auth disabled")
 
-    # rate limit by IP
     rate_limit(f"login:{request.client.host}", max_calls=20, per_seconds=60)  # 20 / min
 
     email = (body.get("email") or "").strip().lower()
@@ -746,3 +784,155 @@ def update_settings(
         """, (user_id, tone, depth))
         conn.commit()
     return {"ok": True, "tone": tone, "depth": depth}
+
+
+# ===== File uploads =====
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def _sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def _extract_text_bytes(filename: str, content: bytes) -> str:
+    name = (filename or "").lower()
+    if name.endswith((".txt", ".md", ".csv", ".log")):
+        return content.decode("utf-8", errors="ignore")
+    if name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            pdf = PdfReader(BytesIO(content))
+            return "\n".join([(p.extract_text() or "") for p in pdf.pages])
+        except Exception:
+            return ""
+    return ""  # other types: store but no text extracted
+
+@app.post("/files/upload")
+async def files_upload(
+    file: UploadFile = File(...),
+    session_id: Optional[int] = Form(None),
+    to_library: bool = Form(False),
+    user_id: Optional[int] = Depends(get_current_user_id) if AUTH_MODE != "none" else None,
+):
+    if AUTH_MODE != "none" and not user_id:
+        raise HTTPException(401, "Not authenticated")
+
+    data = await file.read()
+    sha  = _sha256(data)
+    folder = os.path.join(UPLOAD_DIR, str(user_id or 0))
+    _ensure_dir(folder)
+    ext = Path(file.filename).suffix or ""
+    disk_name = f"{uuid.uuid4().hex}{ext}"
+    disk_path = os.path.join(folder, disk_name)
+    with open(disk_path, "wb") as f:
+        f.write(data)
+
+    mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+
+    with q_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            INSERT INTO user_files(user_id, filename, mime_type, size_bytes, sha256, disk_path, visibility)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (user_id, file.filename, mime, len(data), sha, disk_path, "library" if to_library else "private"),
+        )
+        ufid = cur.fetchone()["id"]
+        conn.commit()
+
+    # Link to chat if provided and not library
+    if session_id and not to_library:
+        with q_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_files(session_id, file_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (session_id, ufid),
+            )
+            conn.commit()
+
+    # Index text (if any)
+    text = _extract_text_bytes(file.filename, data)
+    if text.strip():
+        chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+        with q_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO documents(title, url, space_key, assets, page_id, user_id, session_id, visibility)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (file.filename, None, "upload", None, ufid,
+                 user_id, None if to_library else session_id,
+                 "library" if to_library else "private"),
+            )
+            doc_id = cur.fetchone()["id"]
+            for ch in chunks:
+                emb = embed_once(ch)
+                cur.execute(
+                    """
+                    INSERT INTO document_chunks(doc_id, text, embedding, tsv)
+                    VALUES (%s, %s, %s, to_tsvector('english', %s))
+                    """,
+                    (doc_id, ch, emb, ch)
+                )
+            conn.commit()
+
+    return {"ok": True, "file_id": ufid}
+
+@app.get("/files/list")
+def files_list(
+    session_id: Optional[int] = Query(None),
+    user_id: Optional[int] = Depends(get_current_user_id) if AUTH_MODE != "none" else None,
+):
+    if AUTH_MODE != "none" and not user_id:
+        raise HTTPException(401, "Not authenticated")
+    with q_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        if session_id:
+            cur.execute(
+                """
+                SELECT uf.id, uf.filename, uf.mime_type, uf.size_bytes, uf.visibility
+                FROM user_files uf
+                LEFT JOIN chat_files cf ON cf.file_id = uf.id AND cf.session_id=%s
+                WHERE uf.user_id=%s AND (uf.visibility='library' OR cf.session_id IS NOT NULL)
+                ORDER BY uf.created_at DESC
+                """,
+                (session_id, user_id)
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, filename, mime_type, size_bytes, visibility
+                FROM user_files
+                WHERE user_id=%s
+                ORDER BY created_at DESC
+                """,
+                (user_id,)
+            )
+        return {"files": cur.fetchall()}
+
+@app.delete("/files/{file_id}")
+def files_delete(
+    file_id: int,
+    session_id: Optional[int] = Query(None),
+    user_id: Optional[int] = Depends(get_current_user_id) if AUTH_MODE != "none" else None,
+):
+    if AUTH_MODE != "none" and not user_id:
+        raise HTTPException(401, "Not authenticated")
+
+    with q_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT user_id, disk_path FROM user_files WHERE id=%s", (file_id,))
+        row = cur.fetchone()
+        if not row or (row["user_id"] != user_id):
+            raise HTTPException(404, "File not found")
+
+        if session_id:
+            cur.execute("DELETE FROM chat_files WHERE session_id=%s AND file_id=%s", (session_id, file_id))
+        else:
+            cur.execute("DELETE FROM chat_files WHERE file_id=%s", (file_id,))
+            cur.execute("DELETE FROM user_files WHERE id=%s", (file_id,))
+            try:
+                os.remove(row["disk_path"])
+            except Exception:
+                pass
+        conn.commit()
+
+    return {"ok": True}

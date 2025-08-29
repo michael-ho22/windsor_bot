@@ -1,9 +1,12 @@
 import os
+import time
 import requests
 from requests import HTTPError
 import streamlit as st
 from pathlib import Path
 import sys
+
+# allow importing env_bootstrap from repo root
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from env_bootstrap import load_env
 ROOT = load_env(__file__)
@@ -12,7 +15,7 @@ ROOT = load_env(__file__)
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER") == "1"
 API_URL = os.getenv("API_URL") or ("http://api:8000" if RUNNING_IN_DOCKER else "http://127.0.0.1:8001")
 
-# Put windsor_logo.png next to this file OR set WINDSOR_LOGO to an absolute path
+# Optional: set WINDSOR_LOGO to an absolute path; otherwise leave empty
 LOGO_PATH = os.getenv("WINDSOR_LOGO")
 
 st.set_page_config(page_title="Windsor Knowledge Bot", layout="wide")
@@ -25,6 +28,7 @@ ss.setdefault("session_id", None)
 ss.setdefault("messages", [])
 ss.setdefault("theme_mode", "dark")   # 'dark' | 'light'
 ss.setdefault("show_signup", False)
+ss.setdefault("new_chat_title", None)
 
 # ---------- Theme (Windsor-ish) ----------
 def inject_theme():
@@ -180,6 +184,34 @@ def load_session_messages(session_id: int):
     except Exception as e:
         st.sidebar.error(f"Could not load session: {e}")
 
+# ---- Files API helpers ----
+def api_upload_files(uploaded_files, visibility="private"):
+    """POST /upload; if a chat is open, link files to that chat via session_id."""
+    if not uploaded_files:
+        return {"files": []}
+    files_payload = []
+    for f in uploaded_files:
+        files_payload.append(
+            ("files", (f.name, f.getvalue(), f.type or "application/octet-stream"))
+        )
+    data = {"visibility": visibility}
+    if ss.session_id:
+        data["session_id"] = str(ss.session_id)
+    r = requests.post(f"{API_URL}/upload", files=files_payload, data=data,
+                      headers=auth_headers(), timeout=300)
+    r.raise_for_status()
+    return r.json()
+
+def api_list_my_files(limit=20):
+    try:
+        r = requests.get(f"{API_URL}/my-files", params={"limit": limit},
+                         headers=auth_headers(), timeout=20)
+        r.raise_for_status()
+        return r.json().get("files", [])
+    except Exception:
+        return []
+
+# ---- Auth helpers ----
 def _do_signup(email: str, pw: str):
     r = requests.post(f"{API_URL}/signup", json={"email": email, "password": pw}, timeout=20)
     r.raise_for_status()
@@ -236,7 +268,7 @@ def signup_form_body():
 def render_settings_modal():
     st.markdown(f"**User:** {ss.user_email or 'Not logged in'}")
 
-    # FIX: toggle no longer flips on open. It only changes when you click.
+    # toggle only changes when clicked
     current_light = (ss.theme_mode == "light")
     want_light = st.toggle("Light mode" if not current_light else "Dark mode",
                            value=current_light, key="theme_toggle")
@@ -283,7 +315,7 @@ def render_settings_modal():
 c1, c2 = st.columns([9,1])
 with c1:
     st.markdown('<div class="windsor-title">', unsafe_allow_html=True)
-    if LOGO_PATH and Path(LOGO_PATH).exists():   # ⬅️ guard
+    if LOGO_PATH and Path(LOGO_PATH).exists():
         st.image(LOGO_PATH, width=110)
     else:
         st.markdown("<div style='font-size:58px; line-height:1'>▲</div>", unsafe_allow_html=True)
@@ -311,7 +343,8 @@ with st.sidebar:
         password = st.text_input("Password", type="password", key="login_pw")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Sign up"): open_signup_ui()
+            if st.button("Sign up"):
+                open_signup_ui()
         with c2:
             if st.button("Log in"):
                 try:
@@ -322,11 +355,14 @@ with st.sidebar:
                     st.success("Logged in!")
                     st.rerun()
                 except HTTPError as e:
-                    try: detail = e.response.json().get("detail", e.response.text)
-                    except Exception: detail = getattr(e.response, "text", str(e))
+                    try:
+                        detail = e.response.json().get("detail", e.response.text)
+                    except Exception:
+                        detail = getattr(e.response, "text", str(e))
                     st.error(f"Login failed: {e.response.status_code} — {detail}")
                 except Exception as e:
                     st.error(f"Login failed: {e}")
+
         if ss.show_signup and not hasattr(st, "dialog") and not hasattr(st, "experimental_dialog"):
             st.info("Create your Windsor account")
             with st.container(border=True):
@@ -334,15 +370,16 @@ with st.sidebar:
     else:
         # header row w/ user + logout
         l, r = st.columns([3,1])
-        with l: st.caption(f"Logged in as **{ss.user_email}**")
+        with l:
+            st.caption(f"Logged in as **{ss.user_email}**")
         with r:
             if st.button("Log out"):
                 ss.token = ss.user_email = None
-                ss.session_id = None; ss.messages = []; st.rerun()
+                ss.session_id = None
+                ss.messages = []
+                st.rerun()
 
         st.markdown("### Chats")
-
-        # Chat history
         sessions = fetch_sessions(limit=50)
         if not sessions:
             st.caption("No chats yet.")
@@ -351,9 +388,22 @@ with st.sidebar:
                 sid   = s["id"]
                 title = s.get("title") or f"Chat {sid}"
                 key   = f"chat_{sid}"
-                # style class applied by CSS above
                 if st.button(f"🗨️  {title}", key=key, use_container_width=True):
                     load_session_messages(sid)
+
+        # ---- Recent uploads
+        with st.expander("Your recent files"):
+            files = api_list_my_files(limit=15)
+            if not files:
+                st.caption("No uploads yet.")
+            else:
+                for f in files:
+                    name = f.get("filename") or f.get("name") or "file"
+                    sz   = f.get("size_bytes") or f.get("size") or 0
+                    tag  = ""
+                    if f.get("session_id") and f.get("session_id") == ss.session_id:
+                        tag = " • attached to this chat"
+                    st.markdown(f"- {name} ({sz} bytes){tag}")
 
 # ---------- Toolbar ----------
 col1, col2 = st.columns([3,1])
@@ -361,6 +411,7 @@ with col2:
     if st.button("🆕 New Chat"):
         ss.session_id = None
         ss.messages = []
+        ss.new_chat_title = None
         st.rerun()
 with col1:
     st.caption("Ask a question. Answers are grounded with citations.")
@@ -370,13 +421,60 @@ for m in ss.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# ---------- Chat input ----------
-user_msg = st.chat_input("Type your message")
+# ---------- Chat composer (plus menu + input) ----------
+st.markdown("")
+
+left, mid, right = st.columns([0.07, 0.86, 0.07])
+
+with left:
+    # "+" menu that opens a popover for uploads (like ChatGPT)
+    with st.popover("➕", use_container_width=True):
+        st.markdown("**Add photos & files**")
+        uploads = st.file_uploader(
+            "Choose files",
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="composer_uploader",
+        )
+
+        vis_choice = st.radio(
+            "Visibility",
+            ["Attach to this chat", "Library (reusable)"],
+            index=0,
+            horizontal=True,
+            key="composer_visibility",
+        )
+        visibility = "private" if vis_choice.startswith("Attach") else "library"
+
+        disabled = (not uploads) or (os.getenv("AUTH_MODE", "multi").lower() != "none" and not ss.token)
+        if st.button("Upload", use_container_width=True, disabled=disabled):
+            try:
+                resp = api_upload_files(uploads, visibility=visibility)
+                n = len(resp.get("files", []))
+                st.success(f"Uploaded {n} file(s).")
+                ss.last_upload_refresh = time.time()
+            except HTTPError as e:
+                try:
+                    detail = e.response.json().get("detail", e.response.text)
+                except Exception:
+                    detail = getattr(e.response, "text", str(e))
+                st.error(f"Upload failed: {e.response.status_code} — {detail}")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
+with right:
+    # Optional mic/voice placeholder to mirror the UI (non-functional)
+    st.button("🎙️", help="Voice input (coming soon)", disabled=True, use_container_width=True)
+
+with mid:
+    user_msg = st.chat_input("Ask anything")
+
+# send message (unchanged logic)
 if user_msg:
     if os.getenv("AUTH_MODE", "multi").lower() != "none" and not ss.token:
         st.warning("Log in first to chat.")
     else:
-        ss.messages.append({"role":"user","content":user_msg})
+        ss.messages.append({"role": "user", "content": user_msg})
         with st.chat_message("user"):
             st.markdown(user_msg)
 
@@ -388,11 +486,12 @@ if user_msg:
             "per_doc": int(ss.get("per_doc", 2)),
             "min_score": float(ss.get("min_sc", 0.0)),
         }
-        # NEW: include title if user just created a chat
-        if ss.get("new_chat_title"): 
+        if ss.get("new_chat_title"):
             payload["title"] = ss.pop("new_chat_title")
-        if ss.get("spaces","").strip(): payload["spaces"] = ss.spaces
-        if ss.get("memory_note","").strip(): payload["memory_note"] = ss.memory_note
+        if ss.get("spaces", "").strip():
+            payload["spaces"] = ss.spaces
+        if ss.get("memory_note", "").strip():
+            payload["memory_note"] = ss.memory_note
 
         headers = auth_headers()
         with st.chat_message("assistant"):
@@ -414,7 +513,7 @@ if user_msg:
                             score = s["score"]
                             st.markdown(f"- [{title}]({url}) — score {score:.3f}")
 
-                    ss.messages.append({"role":"assistant","content":answer})
+                    ss.messages.append({"role": "assistant", "content": answer})
                 except HTTPError as e:
                     try:
                         detail = e.response.json().get("detail", e.response.text)
